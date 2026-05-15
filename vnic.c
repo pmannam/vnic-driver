@@ -22,6 +22,36 @@ MODULE_VERSION(DRIVER_VERSION);
 static struct net_device *vnic_devs[VNIC_NUM_DEVS];
 
 /*
+ * vnic_open - bring the interface up
+ *
+ * Called when: ip link set vnic0 up
+ * Starts the TX queue and sets carrier on so the kernel considers
+ * the link ready to send and receive packets.
+ */
+static int vnic_open(struct net_device *dev)
+{
+    netif_start_queue(dev);
+    netif_carrier_on(dev);
+    pr_info(DRIVER_NAME ": %s up\n", dev->name);
+    return 0;
+}
+
+/*
+ * vnic_stop - bring the interface down
+ *
+ * Called when: ip link set vnic0 down
+ * Stops the TX queue and clears carrier so the kernel stops
+ * sending packets through this interface.
+ */
+static int vnic_stop(struct net_device *dev)
+{
+    netif_stop_queue(dev);
+    netif_carrier_off(dev);
+    pr_info(DRIVER_NAME ": %s down\n", dev->name);
+    return 0;
+}
+
+/*
  * vnic_start_xmit - TX stub
  *
  * Drops all packets for now. Forwarding between vnic0 and vnic1
@@ -34,6 +64,8 @@ static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
 }
 
 static const struct net_device_ops vnic_netdev_ops = {
+    .ndo_open       = vnic_open,
+    .ndo_stop       = vnic_stop,
     .ndo_start_xmit = vnic_start_xmit,
 };
 
