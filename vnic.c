@@ -22,6 +22,17 @@ MODULE_VERSION(DRIVER_VERSION);
 static struct net_device *vnic_devs[VNIC_NUM_DEVS];
 
 /*
+ * vnic_priv - private driver data per net_device
+ *
+ * @peer: RCU-protected pointer to the other device in the pair.
+ *        RCU is used because xmit reads this on the hot TX path
+ *        while exit writes NULL during teardown.
+ */
+struct vnic_priv {
+    struct net_device __rcu *peer;
+};
+
+/*
  * vnic_open - bring the interface up
  *
  * Called when: ip link set vnic0 up
@@ -52,14 +63,36 @@ static int vnic_stop(struct net_device *dev)
 }
 
 /*
- * vnic_start_xmit - TX stub
+ * vnic_start_xmit - forward a packet to the peer device
  *
- * Drops all packets for now. Forwarding between vnic0 and vnic1
- * to be implemented.
+ * Looks up the peer under RCU, points the skb at it, and hands it to
+ * the peer's RX path via netif_rx(). This is the "wire" — a function
+ * call that passes the skb pointer across with no copying.
  */
 static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    dev_kfree_skb(skb);
+    struct vnic_priv *priv = netdev_priv(dev);
+    struct net_device *peer;
+
+    rcu_read_lock();
+    peer = rcu_dereference(priv->peer);
+
+    if (unlikely(!peer || !netif_running(peer))) {
+        pr_info(DRIVER_NAME ": %s — peer not available\n", dev->name);
+        dev_kfree_skb(skb);
+        dev->stats.tx_dropped++;
+        rcu_read_unlock();
+        return NETDEV_TX_OK;
+    }
+
+    pr_info(DRIVER_NAME ": %s → %s, len=%d\n", dev->name, peer->name, skb->len);
+
+    if (dev_forward_skb(peer, skb) != NET_RX_SUCCESS) {
+        pr_info(DRIVER_NAME ": dev_forward_skb failed\n");
+        dev->stats.tx_dropped++;
+    }
+
+    rcu_read_unlock();
     return NETDEV_TX_OK;
 }
 
@@ -90,7 +123,7 @@ static int __init vnic_init(void)
 
         snprintf(name, IFNAMSIZ, "vnic%d", i);
 
-        vnic_devs[i] = alloc_netdev(0, name, NET_NAME_PREDICTABLE, vnic_setup);
+        vnic_devs[i] = alloc_netdev(sizeof(struct vnic_priv), name, NET_NAME_PREDICTABLE, vnic_setup);
         if (!vnic_devs[i]) {
             pr_err(DRIVER_NAME ": failed to allocate %s\n", name);
             err = -ENOMEM;
@@ -108,6 +141,10 @@ static int __init vnic_init(void)
         pr_info(DRIVER_NAME ": registered %s\n", name);
     }
 
+    /* Cross-link the two devices as peers */
+    RCU_INIT_POINTER(((struct vnic_priv *)netdev_priv(vnic_devs[0]))->peer, vnic_devs[1]);
+    RCU_INIT_POINTER(((struct vnic_priv *)netdev_priv(vnic_devs[1]))->peer, vnic_devs[0]);
+
     pr_info(DRIVER_NAME ": loaded v%s\n", DRIVER_VERSION);
     return 0;
 
@@ -123,6 +160,14 @@ err_free:
 static void __exit vnic_exit(void)
 {
     int i;
+
+    /* Clear peer pointers before unregistering to prevent any in-flight
+     * xmit from forwarding to a device that is being freed. */
+    for (i = 0; i < VNIC_NUM_DEVS; i++) {
+        if (vnic_devs[i])
+            RCU_INIT_POINTER(((struct vnic_priv *)netdev_priv(vnic_devs[i]))->peer, NULL);
+    }
+    synchronize_rcu();
 
     for (i = 0; i < VNIC_NUM_DEVS; i++) {
         if (vnic_devs[i]) {
