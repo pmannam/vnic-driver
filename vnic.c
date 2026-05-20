@@ -2,8 +2,9 @@
 /*
  * vnic.c - Virtual NIC pair driver
  *
- * Module skeleton — allocate and register two net_devices (vnic0, vnic1).
- * Packets are dropped until forwarding is implemented.
+ * Two virtual network interfaces (vnic0, vnic1) connected by a software
+ * wire. Packets sent on vnic0 arrive on vnic1 and vice versa, with no
+ * physical hardware involved.
  */
 
 #include <linux/module.h>
@@ -11,10 +12,21 @@
 #include <linux/etherdevice.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/ethtool.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
 
-#define DRIVER_NAME    "vnic"
-#define DRIVER_VERSION "0.1"
-#define VNIC_NUM_DEVS  2
+#define DRIVER_NAME      "vnic"
+#define DRIVER_VERSION   "0.2"
+#define VNIC_NUM_DEVS    2
+
+/*
+ * TX ring — must be a power of 2 so head & MASK replaces head % SIZE.
+ * WAKE_THRESH creates hysteresis: stop at 256, wake at 64, preventing
+ * rapid stop/start oscillation under sustained load.
+ */
+#define VNIC_TX_RING_SIZE   256
+#define VNIC_TX_RING_MASK   (VNIC_TX_RING_SIZE - 1)
+#define VNIC_TX_WAKE_THRESH (VNIC_TX_RING_SIZE / 4)
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Pavan");
@@ -23,12 +35,6 @@ MODULE_VERSION(DRIVER_VERSION);
 
 static struct net_device *vnic_devs[VNIC_NUM_DEVS];
 
-/*
- * vnic_pcpu_stats - per-CPU statistics
- *
- * Per-CPU avoids false sharing — each core updates its own copy.
- * u64_stats_sync provides consistent reads without disabling interrupts.
- */
 struct vnic_pcpu_stats {
     u64 rx_packets;
     u64 rx_bytes;
@@ -40,108 +46,216 @@ struct vnic_pcpu_stats {
 };
 
 /*
- * vnic_priv - private driver data per net_device
+ * vnic_tx_ring - circular TX descriptor ring
  *
- * @peer:       RCU-protected pointer to the other device in the pair.
- *              RCU is used because xmit reads this on the hot TX path
- *              while exit writes NULL during teardown.
- * @pcpu_stats: per-CPU stats, aggregated by ndo_get_stats64.
+ * head: next slot to fill   — written by vnic_start_xmit (softirq)
+ * tail: next slot to drain  — written by vnic_tx_thread  (process context)
+ *
+ * Full:  head - tail == VNIC_TX_RING_SIZE
+ * Empty: head == tail
+ *
+ * Unsigned subtraction wraps correctly at UINT_MAX with no special handling.
+ * lock is held by xmit (spin_lock, BH already off) and kthread (spin_lock_bh).
  */
-struct vnic_priv {
-    struct net_device __rcu        *peer;
-    struct vnic_pcpu_stats __percpu *pcpu_stats;
+struct vnic_tx_ring {
+    struct sk_buff    *desc[VNIC_TX_RING_SIZE];
+    unsigned int       head;
+    unsigned int       tail;
+    spinlock_t         lock;
 };
 
 /*
- * vnic_open - bring the interface up
+ * vnic_priv - private driver data per net_device
  *
- * Called when: ip link set vnic0 up
- * Starts the TX queue and sets carrier on so the kernel considers
- * the link ready to send and receive packets.
+ * @peer:       RCU-protected pointer to the paired device.
+ * @pcpu_stats: per-CPU counters, aggregated in ndo_get_stats64.
+ * @tx_ring:    TX descriptor ring shared between xmit and the kthread.
+ * @tx_thread:  kernel thread simulating the hardware DMA engine.
+ * @tx_wq:      wait queue — xmit wakes the thread after enqueuing.
  */
+struct vnic_priv {
+    struct net_device __rcu          *peer;
+    struct vnic_pcpu_stats __percpu  *pcpu_stats;
+    struct vnic_tx_ring               tx_ring;
+    struct task_struct               *tx_thread;
+    wait_queue_head_t                 tx_wq;
+};
+
+/*
+ * vnic_tx_thread - simulated DMA engine, one per device
+ *
+ * Drains the TX ring and forwards each skb to the peer via
+ * dev_forward_skb().  Wakes the TX queue when the ring drops below
+ * VNIC_TX_WAKE_THRESH, giving the stack room to enqueue more work.
+ *
+ * Locking: spin_lock_bh because the TX softirq (vnic_start_xmit) holds
+ * spin_lock on the same ring.  _bh disables softirqs so the softirq
+ * cannot preempt the kthread and deadlock on the same spinlock.
+ */
+static int vnic_tx_thread(void *data)
+{
+    struct net_device *dev  = data;
+    struct vnic_priv  *priv = netdev_priv(dev);
+
+    while (!kthread_should_stop()) {
+        wait_event_interruptible(priv->tx_wq,
+            READ_ONCE(priv->tx_ring.head) != READ_ONCE(priv->tx_ring.tail) ||
+            kthread_should_stop());
+
+        while (READ_ONCE(priv->tx_ring.head) != READ_ONCE(priv->tx_ring.tail)) {
+            struct vnic_pcpu_stats *pcpu;
+            struct net_device *peer;
+            struct sk_buff *skb;
+            unsigned int len;
+            bool do_wake;
+
+            spin_lock_bh(&priv->tx_ring.lock);
+            if (priv->tx_ring.head == priv->tx_ring.tail) {
+                spin_unlock_bh(&priv->tx_ring.lock);
+                break;
+            }
+            skb = priv->tx_ring.desc[priv->tx_ring.tail & VNIC_TX_RING_MASK];
+            priv->tx_ring.tail++;
+            do_wake = netif_queue_stopped(dev) &&
+                      (priv->tx_ring.head - priv->tx_ring.tail <= VNIC_TX_WAKE_THRESH);
+            spin_unlock_bh(&priv->tx_ring.lock);
+
+            /* wake_queue called outside the lock — it may trigger xmit
+             * on another CPU which would try to re-acquire the lock */
+            if (do_wake)
+                netif_wake_queue(dev);
+
+            len = skb->len;
+            rcu_read_lock();
+            peer = rcu_dereference(priv->peer);
+            if (likely(peer && netif_running(peer))) {
+                pr_info(DRIVER_NAME ": %s → %s, len=%u\n",
+                        dev->name, peer->name, len);
+                if (dev_forward_skb(peer, skb) == NET_RX_SUCCESS) {
+                    pcpu = get_cpu_ptr(priv->pcpu_stats);
+                    u64_stats_update_begin(&pcpu->syncp);
+                    pcpu->tx_packets++;
+                    pcpu->tx_bytes += len;
+                    u64_stats_update_end(&pcpu->syncp);
+                    put_cpu_ptr(priv->pcpu_stats);
+
+                    pcpu = get_cpu_ptr(
+                        ((struct vnic_priv *)netdev_priv(peer))->pcpu_stats);
+                    u64_stats_update_begin(&pcpu->syncp);
+                    pcpu->rx_packets++;
+                    pcpu->rx_bytes += len;
+                    u64_stats_update_end(&pcpu->syncp);
+                    put_cpu_ptr(
+                        ((struct vnic_priv *)netdev_priv(peer))->pcpu_stats);
+                } else {
+                    pr_info(DRIVER_NAME ": dev_forward_skb failed\n");
+                    pcpu = get_cpu_ptr(priv->pcpu_stats);
+                    u64_stats_update_begin(&pcpu->syncp);
+                    pcpu->tx_drops++;
+                    u64_stats_update_end(&pcpu->syncp);
+                    put_cpu_ptr(priv->pcpu_stats);
+                }
+            } else {
+                dev_kfree_skb(skb);
+                pcpu = get_cpu_ptr(priv->pcpu_stats);
+                u64_stats_update_begin(&pcpu->syncp);
+                pcpu->tx_drops++;
+                u64_stats_update_end(&pcpu->syncp);
+                put_cpu_ptr(priv->pcpu_stats);
+            }
+            rcu_read_unlock();
+        }
+    }
+    return 0;
+}
+
 static int vnic_open(struct net_device *dev)
 {
+    struct vnic_priv *priv = netdev_priv(dev);
+
+    priv->tx_thread = kthread_run(vnic_tx_thread, dev, "%s-tx", dev->name);
+    if (IS_ERR(priv->tx_thread)) {
+        pr_err(DRIVER_NAME ": failed to start TX thread for %s\n", dev->name);
+        return PTR_ERR(priv->tx_thread);
+    }
     netif_start_queue(dev);
     netif_carrier_on(dev);
     pr_info(DRIVER_NAME ": %s up\n", dev->name);
     return 0;
 }
 
-/*
- * vnic_stop - bring the interface down
- *
- * Called when: ip link set vnic0 down
- * Stops the TX queue and clears carrier so the kernel stops
- * sending packets through this interface.
- */
 static int vnic_stop(struct net_device *dev)
 {
+    struct vnic_priv *priv = netdev_priv(dev);
+    struct sk_buff *skb;
+
     netif_stop_queue(dev);
     netif_carrier_off(dev);
+
+    if (priv->tx_thread) {
+        kthread_stop(priv->tx_thread);
+        priv->tx_thread = NULL;
+    }
+
+    /* drain any skbs the kthread did not process before stopping */
+    spin_lock_bh(&priv->tx_ring.lock);
+    while (priv->tx_ring.tail != priv->tx_ring.head) {
+        skb = priv->tx_ring.desc[priv->tx_ring.tail & VNIC_TX_RING_MASK];
+        priv->tx_ring.tail++;
+        dev_kfree_skb(skb);
+    }
+    spin_unlock_bh(&priv->tx_ring.lock);
+
     pr_info(DRIVER_NAME ": %s down\n", dev->name);
     return 0;
 }
 
 /*
- * vnic_start_xmit - forward a packet to the peer device
+ * vnic_start_xmit - enqueue skb onto the TX descriptor ring
  *
- * Looks up the peer under RCU and hands the skb to the peer's RX path
- * via dev_forward_skb(). Updates TX stats on the sender and RX stats
- * on the receiver.
+ * Does not forward the packet — writes the skb pointer into the ring
+ * and wakes the TX thread (simulating a doorbell write to hardware).
+ * If the ring is full, stops the queue to apply backpressure.
+ *
+ * Locking: spin_lock (not _bh) because we are already in softirq context
+ * (BH disabled), so there is no risk of deadlock from a softirq preempting
+ * us and re-acquiring the same lock.
  */
 static netdev_tx_t vnic_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct vnic_priv *priv = netdev_priv(dev);
     struct vnic_pcpu_stats *pcpu;
-    struct net_device *peer;
     unsigned int len = skb->len;
 
-    rcu_read_lock();
-    peer = rcu_dereference(priv->peer);
+    spin_lock(&priv->tx_ring.lock);
 
-    if (unlikely(!peer || !netif_running(peer))) {
-        pr_info(DRIVER_NAME ": %s — peer not available\n", dev->name);
+    if (unlikely(priv->tx_ring.head - priv->tx_ring.tail >= VNIC_TX_RING_SIZE)) {
+        netif_stop_queue(dev);
+        spin_unlock(&priv->tx_ring.lock);
         dev_kfree_skb(skb);
         pcpu = this_cpu_ptr(priv->pcpu_stats);
         u64_stats_update_begin(&pcpu->syncp);
         pcpu->tx_drops++;
         u64_stats_update_end(&pcpu->syncp);
-        rcu_read_unlock();
         return NETDEV_TX_OK;
     }
 
-    pr_info(DRIVER_NAME ": %s → %s, len=%d\n", dev->name, peer->name, len);
+    priv->tx_ring.desc[priv->tx_ring.head & VNIC_TX_RING_MASK] = skb;
+    priv->tx_ring.head++;
 
-    if (dev_forward_skb(peer, skb) == NET_RX_SUCCESS) {
-        pcpu = this_cpu_ptr(priv->pcpu_stats);
-        u64_stats_update_begin(&pcpu->syncp);
-        pcpu->tx_packets++;
-        pcpu->tx_bytes += len;
-        u64_stats_update_end(&pcpu->syncp);
+    pr_info(DRIVER_NAME ": %s enqueued len=%u ring=%u/%u\n",
+            dev->name, len,
+            priv->tx_ring.head - priv->tx_ring.tail, VNIC_TX_RING_SIZE);
 
-        pcpu = this_cpu_ptr(((struct vnic_priv *)netdev_priv(peer))->pcpu_stats);
-        u64_stats_update_begin(&pcpu->syncp);
-        pcpu->rx_packets++;
-        pcpu->rx_bytes += len;
-        u64_stats_update_end(&pcpu->syncp);
-    } else {
-        pr_info(DRIVER_NAME ": dev_forward_skb failed\n");
-        pcpu = this_cpu_ptr(priv->pcpu_stats);
-        u64_stats_update_begin(&pcpu->syncp);
-        pcpu->tx_drops++;
-        u64_stats_update_end(&pcpu->syncp);
-    }
+    if (priv->tx_ring.head - priv->tx_ring.tail >= VNIC_TX_RING_SIZE)
+        netif_stop_queue(dev);
 
-    rcu_read_unlock();
+    spin_unlock(&priv->tx_ring.lock);
+
+    wake_up(&priv->tx_wq);
     return NETDEV_TX_OK;
 }
 
-/*
- * vnic_get_stats64 - return interface statistics
- *
- * Aggregates per-CPU stats across all CPUs. Called when userspace
- * runs "ip -s link show vnic0".
- */
 static void vnic_get_stats64(struct net_device *dev,
                               struct rtnl_link_stats64 *stats)
 {
@@ -192,11 +306,6 @@ static const struct ethtool_ops vnic_ethtool_ops = {
     .get_link    = ethtool_op_get_link,
 };
 
-/*
- * vnic_setup - initialize net_device fields
- *
- * Called by alloc_netdev(). Sets Ethernet defaults and assigns our ops.
- */
 static void vnic_setup(struct net_device *dev)
 {
     ether_setup(dev);
@@ -210,20 +319,23 @@ static int __init vnic_init(void)
     int i, err;
 
     for (i = 0; i < VNIC_NUM_DEVS; i++) {
+        struct vnic_priv *priv;
         char name[IFNAMSIZ];
 
         snprintf(name, IFNAMSIZ, "vnic%d", i);
 
-        vnic_devs[i] = alloc_netdev(sizeof(struct vnic_priv), name, NET_NAME_PREDICTABLE, vnic_setup);
+        vnic_devs[i] = alloc_netdev(sizeof(struct vnic_priv), name,
+                                    NET_NAME_PREDICTABLE, vnic_setup);
         if (!vnic_devs[i]) {
             pr_err(DRIVER_NAME ": failed to allocate %s\n", name);
             err = -ENOMEM;
             goto err_free;
         }
 
-        ((struct vnic_priv *)netdev_priv(vnic_devs[i]))->pcpu_stats =
-            netdev_alloc_pcpu_stats(struct vnic_pcpu_stats);
-        if (!((struct vnic_priv *)netdev_priv(vnic_devs[i]))->pcpu_stats) {
+        priv = netdev_priv(vnic_devs[i]);
+
+        priv->pcpu_stats = netdev_alloc_pcpu_stats(struct vnic_pcpu_stats);
+        if (!priv->pcpu_stats) {
             pr_err(DRIVER_NAME ": failed to allocate pcpu_stats for %s\n", name);
             free_netdev(vnic_devs[i]);
             vnic_devs[i] = NULL;
@@ -231,10 +343,14 @@ static int __init vnic_init(void)
             goto err_free;
         }
 
+        spin_lock_init(&priv->tx_ring.lock);
+        init_waitqueue_head(&priv->tx_wq);
+        priv->tx_thread = NULL;
+
         err = register_netdev(vnic_devs[i]);
         if (err) {
             pr_err(DRIVER_NAME ": failed to register %s: %d\n", name, err);
-            free_percpu(((struct vnic_priv *)netdev_priv(vnic_devs[i]))->pcpu_stats);
+            free_percpu(priv->pcpu_stats);
             free_netdev(vnic_devs[i]);
             vnic_devs[i] = NULL;
             goto err_free;
@@ -264,8 +380,8 @@ static void __exit vnic_exit(void)
 {
     int i;
 
-    /* Clear peer pointers before unregistering to prevent any in-flight
-     * xmit from forwarding to a device that is being freed. */
+    /* Clear peer pointers before unregistering — in-flight kthread iterations
+     * after this point will see peer=NULL and drop skbs safely. */
     for (i = 0; i < VNIC_NUM_DEVS; i++) {
         if (vnic_devs[i])
             RCU_INIT_POINTER(((struct vnic_priv *)netdev_priv(vnic_devs[i]))->peer, NULL);
@@ -275,7 +391,7 @@ static void __exit vnic_exit(void)
     for (i = 0; i < VNIC_NUM_DEVS; i++) {
         if (vnic_devs[i]) {
             free_percpu(((struct vnic_priv *)netdev_priv(vnic_devs[i]))->pcpu_stats);
-            unregister_netdev(vnic_devs[i]);
+            unregister_netdev(vnic_devs[i]); /* calls vnic_stop if UP */
             free_netdev(vnic_devs[i]);
             vnic_devs[i] = NULL;
         }
