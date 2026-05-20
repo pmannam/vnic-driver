@@ -7,3 +7,4 @@
 *.symvers
 *.cmd
 .tmp_versions/
+notes.md
